@@ -525,11 +525,14 @@ func TestAutoCompactionIntervalParse(t *testing.T) {
 		wdur     time.Duration
 	}{
 		{"", false, 0},
+		{"0s", false, 0},
 		{"1", true, 0},
 		{"1h", false, time.Hour},
 		{"1s", false, time.Second},
+		{"1m30s", false, 90 * time.Second},
 		{"a", true, 0},
 		{"-1", true, 0},
+		{"-1m", true, 0},
 	}
 
 	hasErr := func(err error) bool {
@@ -544,6 +547,32 @@ func TestAutoCompactionIntervalParse(t *testing.T) {
 		if dur != tt.wdur {
 			t.Errorf("#%d: duration = %s, want %s", i, dur, tt.wdur)
 		}
+	}
+}
+
+func TestAutoCompactionIntervalValidate(t *testing.T) {
+	tests := []struct {
+		interval string
+		wantErr  string
+	}{
+		{interval: ""},
+		{interval: "30s"},
+		{interval: "30", wantErr: `invalid auto-compaction-interval "30", want a duration`},
+		{interval: "-1m", wantErr: `invalid auto-compaction-interval "-1m", must not be negative`},
+	}
+	for _, tt := range tests {
+		t.Run(tt.interval, func(t *testing.T) {
+			cfg := NewConfig()
+			cfg.Logger = "zap"
+			cfg.LogOutputs = []string{"/dev/null"}
+			cfg.AutoCompactionInterval = tt.interval
+			err := cfg.Validate()
+			if tt.wantErr == "" {
+				require.NoError(t, err)
+				return
+			}
+			require.ErrorContains(t, err, tt.wantErr)
+		})
 	}
 }
 

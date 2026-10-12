@@ -169,7 +169,7 @@ Clustering:
   --auto-compaction-mode 'periodic'
     Interpret 'auto-compaction-retention' one of: periodic|revision. 'periodic' for duration based retention, defaulting to hours if no time unit is provided (e.g. '5m'). 'revision' for revision number based retention.
   --auto-compaction-interval ''
-    Auto compaction interval. Empty means use default based on mode selected.
+    How often auto compaction runs, as a duration such as '30s' or '5m'. Empty means the default of the mode: every 5 minutes for 'revision', and every retention period, at most hourly, for 'periodic'.
 
 Security:
   --cert-file ''

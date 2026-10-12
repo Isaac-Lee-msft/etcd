@@ -370,7 +370,7 @@ func print(lg *zap.Logger, ec Config, sc config.ServerConfig, memberInitialized 
 		zap.Duration("compact-check-time-interval", sc.CompactHashCheckTime),
 		zap.String("auto-compaction-mode", sc.AutoCompactionMode),
 		zap.Duration("auto-compaction-retention", sc.AutoCompactionRetention),
-		zap.String("auto-compaction-interval", sc.AutoCompactionRetention.String()),
+		zap.Duration("auto-compaction-interval", sc.AutoCompactionInterval),
 
 		zap.String("discovery-token", sc.DiscoveryCfg.Token),
 		zap.String("discovery-endpoints", strings.Join(sc.DiscoveryCfg.Endpoints, ",")),
@@ -931,11 +931,20 @@ func (e *Etcd) GetLogger() *zap.Logger {
 	return l
 }
 
-func parseCompactionInterval(interval string) (ret time.Duration, err error) {
+// parseCompactionInterval parses --auto-compaction-interval. An empty value or 0
+// returns 0, which keeps the default interval of the compaction mode.
+func parseCompactionInterval(interval string) (time.Duration, error) {
 	if interval == "" {
-		return ret, nil
+		return 0, nil
 	}
-	return time.ParseDuration(interval)
+	d, err := time.ParseDuration(interval)
+	if err != nil {
+		return 0, fmt.Errorf("invalid auto-compaction-interval %q, want a duration such as '30s' or '5m': %w", interval, err)
+	}
+	if d < 0 {
+		return 0, fmt.Errorf("invalid auto-compaction-interval %q, must not be negative", interval)
+	}
+	return d, nil
 }
 
 func parseCompactionRetention(mode, retention string) (ret time.Duration, err error) {

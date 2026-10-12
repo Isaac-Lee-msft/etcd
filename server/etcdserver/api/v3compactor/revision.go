@@ -46,12 +46,15 @@ type Revision struct {
 	paused bool
 }
 
+// revInterval is how often the revision compactor runs when no interval is configured.
+const revInterval = 5 * time.Minute
+
 // newRevision creates a new instance of Revisonal compactor that purges
 // the log older than retention revisions from the current revision.
+// It runs every interval, or every revInterval if interval is 0.
 func newRevision(lg *zap.Logger, clock clockwork.Clock, retention int64, interval time.Duration, rg RevGetter, c Compactable) *Revision {
-	// default revision interval to 5 minutes
 	if interval == 0 {
-		interval = time.Minute * 5
+		interval = revInterval
 	}
 	rc := &Revision{
 		lg:        lg,
@@ -92,6 +95,7 @@ func (rc *Revision) Run() {
 				"starting auto revision compaction",
 				zap.Int64("revision", rev),
 				zap.Int64("revision-compaction-retention", rc.retention),
+				zap.Duration("compact-interval", rc.interval),
 			)
 			_, err := rc.c.Compact(rc.ctx, &pb.CompactionRequest{Revision: rev})
 			if err == nil || errors.Is(err, mvcc.ErrCompacted) {

@@ -139,6 +139,7 @@ func (pc *Periodic) Run() {
 				"starting auto periodic compaction",
 				zap.Int64("revision", rev),
 				zap.Duration("compact-period", pc.period),
+				zap.Duration("compact-interval", compactInterval),
 			)
 			startTime := pc.clock.Now()
 			_, err := pc.c.Compact(pc.ctx, &pb.CompactionRequest{Revision: rev})
@@ -164,8 +165,9 @@ func (pc *Periodic) Run() {
 	}()
 }
 
-// if static interval is provided, compact every x duration.
-// if given compaction period x is <1-hour, compact every x duration.
+// getCompactInterval returns how often to compact after the first compaction.
+// If an interval is configured, compact every interval.
+// Otherwise, if given compaction period x is <1-hour, compact every x duration.
 // (e.g. --auto-compaction-mode 'periodic' --auto-compaction-retention='10m', then compact every 10-minute)
 // if given compaction period x is >1-hour, compact every hour.
 // (e.g. --auto-compaction-mode 'periodic' --auto-compaction-retention='2h', then compact every 1-hour)
@@ -186,12 +188,20 @@ func (pc *Periodic) getRetentions() int {
 
 const retryDivisor = 10
 
+// getRetryInterval returns how often the compactor records the current revision
+// and checks whether to compact. It is a tenth of the period (at most 1 hour),
+// or the configured interval if that is shorter, so that a short interval is
+// not rounded up to the check cadence.
 func (pc *Periodic) getRetryInterval() time.Duration {
 	itv := pc.period
 	if itv > time.Hour {
 		itv = time.Hour
 	}
-	return itv / retryDivisor
+	itv /= retryDivisor
+	if pc.interval > 0 && pc.interval < itv {
+		itv = pc.interval
+	}
+	return itv
 }
 
 // Stop stops periodic compactor.

@@ -20,30 +20,29 @@ import (
 	"time"
 
 	"github.com/jonboulle/clockwork"
+	"github.com/stretchr/testify/require"
 	"go.uber.org/zap/zaptest"
 
 	pb "go.etcd.io/etcd/api/v3/etcdserverpb"
 	"go.etcd.io/etcd/client/pkg/v3/testutil"
 )
 
-const testRevInterval = 5 * time.Minute
-
 func TestRevision(t *testing.T) {
 	fc := clockwork.NewFakeClock()
 	rg := &fakeRevGetter{testutil.NewRecorderStreamWithWaitTimout(10 * time.Millisecond), 0}
 	compactable := &fakeCompactable{testutil.NewRecorderStreamWithWaitTimout(10 * time.Millisecond)}
-	tb := newRevision(zaptest.NewLogger(t), fc, 10, testRevInterval, rg, compactable)
+	tb := newRevision(zaptest.NewLogger(t), fc, 10, 0, rg, compactable)
 
 	tb.Run()
 	defer tb.Stop()
 
-	fc.Advance(testRevInterval)
+	fc.Advance(revInterval)
 	rg.Wait(1)
 	// nothing happens
 
 	rg.SetRev(99) // will be 100
 	expectedRevision := int64(90)
-	fc.Advance(testRevInterval)
+	fc.Advance(revInterval)
 	rg.Wait(1)
 	a, err := compactable.Wait(1)
 	if err != nil {
@@ -60,7 +59,7 @@ func TestRevision(t *testing.T) {
 
 	rg.SetRev(199) // will be 200
 	expectedRevision = int64(190)
-	fc.Advance(testRevInterval)
+	fc.Advance(revInterval)
 	rg.Wait(1)
 	a, err = compactable.Wait(1)
 	if err != nil {
@@ -75,15 +74,15 @@ func TestRevisionPause(t *testing.T) {
 	fc := clockwork.NewFakeClock()
 	rg := &fakeRevGetter{testutil.NewRecorderStream(), 99} // will be 100
 	compactable := &fakeCompactable{testutil.NewRecorderStream()}
-	tb := newRevision(zaptest.NewLogger(t), fc, 10, testRevInterval, rg, compactable)
+	tb := newRevision(zaptest.NewLogger(t), fc, 10, 0, rg, compactable)
 
 	tb.Run()
 	tb.Pause()
 
 	// tb will collect 3 hours of revisions but not compact since paused
-	n := int(time.Hour / testRevInterval)
+	n := int(time.Hour / revInterval)
 	for i := 0; i < 3*n; i++ {
-		fc.Advance(testRevInterval)
+		fc.Advance(revInterval)
 	}
 	// tb ends up waiting for the clock
 
@@ -97,7 +96,7 @@ func TestRevisionPause(t *testing.T) {
 	tb.Resume()
 
 	// unblock clock, will kick off a compaction at hour 3:05
-	fc.Advance(testRevInterval)
+	fc.Advance(revInterval)
 	rg.Wait(1)
 	a, err := compactable.Wait(1)
 	if err != nil {
@@ -106,5 +105,37 @@ func TestRevisionPause(t *testing.T) {
 	wreq := &pb.CompactionRequest{Revision: int64(90)}
 	if !reflect.DeepEqual(a[0].Params[0], wreq) {
 		t.Errorf("compact request = %v, want %v", a[0].Params[0], wreq.Revision)
+	}
+}
+
+func TestRevisionDefaultInterval(t *testing.T) {
+	rg := &fakeRevGetter{testutil.NewRecorderStream(), 0}
+	compactable := &fakeCompactable{testutil.NewRecorderStream()}
+	tb := newRevision(zaptest.NewLogger(t), clockwork.NewFakeClock(), 10, 0, rg, compactable)
+	require.Equal(t, revInterval, tb.interval)
+}
+
+// TestRevisionInterval checks that a configured interval replaces the default
+// of 5 minutes between compactions.
+func TestRevisionInterval(t *testing.T) {
+	interval := 30 * time.Second
+	fc := clockwork.NewFakeClock()
+	rg := &fakeRevGetter{testutil.NewRecorderStream(), 99} // will be 100
+	compactable := &fakeCompactable{testutil.NewRecorderStream()}
+	tb := newRevision(zaptest.NewLogger(t), fc, 10, interval, rg, compactable)
+
+	tb.Run()
+	defer tb.Stop()
+
+	for _, wantRevision := range []int64{90, 190} {
+		// Wait until the compactor sleeps on the clock, then wake it after one interval.
+		require.NoError(t, fc.BlockUntilContext(t.Context(), 1))
+		fc.Advance(interval)
+		_, err := rg.Wait(1)
+		require.NoError(t, err)
+		a, err := compactable.Wait(1)
+		require.NoError(t, err)
+		require.Equal(t, &pb.CompactionRequest{Revision: wantRevision}, a[0].Params[0])
+		rg.SetRev(199) // will be 200
 	}
 }

@@ -22,6 +22,7 @@ import (
 	"time"
 
 	"github.com/jonboulle/clockwork"
+	"github.com/stretchr/testify/require"
 	"go.uber.org/zap/zaptest"
 
 	pb "go.etcd.io/etcd/api/v3/etcdserverpb"
@@ -31,13 +32,12 @@ import (
 func TestPeriodicHourly(t *testing.T) {
 	retentionHours := 2
 	retentionDuration := time.Duration(retentionHours) * time.Hour
-	intervalDuration := time.Duration(0)
 
 	fc := clockwork.NewFakeClock()
 	// TODO: Do not depand or real time (Recorder.Wait) in unit tests.
 	rg := &fakeRevGetter{testutil.NewRecorderStreamWithWaitTimout(0), 0}
 	compactable := &fakeCompactable{testutil.NewRecorderStreamWithWaitTimout(10 * time.Millisecond)}
-	tb := newPeriodic(zaptest.NewLogger(t), fc, retentionDuration, intervalDuration, rg, compactable)
+	tb := newPeriodic(zaptest.NewLogger(t), fc, retentionDuration, 0, rg, compactable)
 
 	tb.Run()
 	defer tb.Stop()
@@ -84,12 +84,11 @@ func TestPeriodicHourly(t *testing.T) {
 func TestPeriodicMinutes(t *testing.T) {
 	retentionMinutes := 5
 	retentionDuration := time.Duration(retentionMinutes) * time.Minute
-	intervalDuration := time.Duration(0)
 
 	fc := clockwork.NewFakeClock()
 	rg := &fakeRevGetter{testutil.NewRecorderStreamWithWaitTimout(0), 0}
 	compactable := &fakeCompactable{testutil.NewRecorderStreamWithWaitTimout(10 * time.Millisecond)}
-	tb := newPeriodic(zaptest.NewLogger(t), fc, retentionDuration, intervalDuration, rg, compactable)
+	tb := newPeriodic(zaptest.NewLogger(t), fc, retentionDuration, 0, rg, compactable)
 
 	tb.Run()
 	defer tb.Stop()
@@ -132,64 +131,96 @@ func TestPeriodicMinutes(t *testing.T) {
 	}
 }
 
+// TestPeriodicMinutesWithInterval checks that a configured interval sets how
+// often compaction runs after the first one, which still waits for one
+// retention period.
 func TestPeriodicMinutesWithInterval(t *testing.T) {
-	retentionMinutes := 10
-	retentionDuration := time.Duration(retentionMinutes) * time.Minute
+	retentionDuration := 10 * time.Minute
 	intervalDuration := 2 * time.Minute
 
 	fc := clockwork.NewFakeClock()
-	rg := &fakeRevGetter{testutil.NewRecorderStreamWithWaitTimout(10 * time.Millisecond), 0}
+	rg := &fakeRevGetter{testutil.NewRecorderStreamWithWaitTimout(0), 0}
 	compactable := &fakeCompactable{testutil.NewRecorderStreamWithWaitTimout(10 * time.Millisecond)}
 	tb := newPeriodic(zaptest.NewLogger(t), fc, retentionDuration, intervalDuration, rg, compactable)
 
 	tb.Run()
 	defer tb.Stop()
 
+	retryInterval := tb.getRetryInterval() // a tenth of the retention: 1 minute
+	checksPerInterval := int(intervalDuration / retryInterval)
+
 	// compaction doesn't happen til 10 minutes elapse
-	for i := 0; i < retentionMinutes; i++ {
-		rg.Wait(1)
-		fc.Advance(tb.getRetryInterval())
+	for i := 0; i < tb.getRetentions()-1; i++ {
+		waitOneAction(t, rg)
+		fc.Advance(retryInterval)
 	}
 
 	// very first compaction
-	a, err := compactable.Wait(1)
-	if err != nil {
-		t.Fatal(err)
+	a, err := waitWithRetry(t, compactable)
+	require.NoError(t, err)
+	require.Equal(t, &pb.CompactionRequest{Revision: 1}, a[0].Params[0])
+
+	// compaction happens every interval and keeps 10 minutes of revisions
+	for i := 0; i < 5; i++ {
+		for j := 0; j < checksPerInterval; j++ {
+			waitOneAction(t, rg)
+			fc.Advance(retryInterval)
+		}
+
+		a, err := waitWithRetry(t, compactable)
+		require.NoError(t, err)
+		require.Equal(t, &pb.CompactionRequest{Revision: int64((i + 1) * checksPerInterval)}, a[0].Params[0])
 	}
-	expectedRevision := int64(1)
-	if !reflect.DeepEqual(a[0].Params[0], &pb.CompactionRequest{Revision: expectedRevision}) {
-		t.Errorf("compact request = %v, want %v", a[0].Params[0], &pb.CompactionRequest{Revision: expectedRevision})
+}
+
+// TestPeriodicIntervalShorterThanRetryInterval checks that an interval shorter
+// than a tenth of the retention takes effect, instead of being rounded up to
+// how often the compactor checks.
+func TestPeriodicIntervalShorterThanRetryInterval(t *testing.T) {
+	retentionDuration := time.Hour // checked every 6 minutes without an interval
+	intervalDuration := time.Minute
+
+	fc := clockwork.NewFakeClock()
+	rg := &fakeRevGetter{testutil.NewRecorderStreamWithWaitTimout(0), 0}
+	compactable := &fakeCompactable{testutil.NewRecorderStreamWithWaitTimout(10 * time.Millisecond)}
+	tb := newPeriodic(zaptest.NewLogger(t), fc, retentionDuration, intervalDuration, rg, compactable)
+	require.Equal(t, intervalDuration, tb.getRetryInterval())
+
+	tb.Run()
+	defer tb.Stop()
+
+	// compaction doesn't happen til 1 hour elapses
+	for i := 0; i < tb.getRetentions()-1; i++ {
+		waitOneAction(t, rg)
+		fc.Advance(intervalDuration)
 	}
 
-	for i := 0; i < 10; i++ {
-		// advance 20 minutes, one revision for each minute
-		for j := 0; j < 20; j++ {
-			rg.Wait(1)
-			fc.Advance(1 * time.Minute)
-		}
+	// very first compaction
+	a, err := waitWithRetry(t, compactable)
+	require.NoError(t, err)
+	require.Equal(t, &pb.CompactionRequest{Revision: 1}, a[0].Params[0])
 
-		// compact
-		a, err := compactable.Wait(1)
-		if err != nil {
-			t.Fatal(err)
-		}
+	// the next check finds the same oldest revision and skips
+	waitOneAction(t, rg)
+	fc.Advance(intervalDuration)
 
-		// the expected revision is the current revision minus the retention duration
-		// since we made a revision every minute
-		expectedRevision := rg.rev - int64(retentionDuration.Minutes())
-		if !reflect.DeepEqual(a[0].Params[0], &pb.CompactionRequest{Revision: expectedRevision}) {
-			t.Errorf("compact request = %v, want %v", a[0].Params[0], &pb.CompactionRequest{Revision: expectedRevision})
-		}
+	// after that, compaction happens every minute
+	for wantRevision := int64(2); wantRevision <= 6; wantRevision++ {
+		waitOneAction(t, rg)
+		fc.Advance(intervalDuration)
+
+		a, err := waitWithRetry(t, compactable)
+		require.NoError(t, err)
+		require.Equal(t, &pb.CompactionRequest{Revision: wantRevision}, a[0].Params[0])
 	}
 }
 
 func TestPeriodicPause(t *testing.T) {
 	fc := clockwork.NewFakeClock()
 	retentionDuration := time.Hour
-	intervalDuration := time.Duration(0)
 	rg := &fakeRevGetter{testutil.NewRecorderStreamWithWaitTimout(0), 0}
 	compactable := &fakeCompactable{testutil.NewRecorderStreamWithWaitTimout(10 * time.Millisecond)}
-	tb := newPeriodic(zaptest.NewLogger(t), fc, retentionDuration, intervalDuration, rg, compactable)
+	tb := newPeriodic(zaptest.NewLogger(t), fc, retentionDuration, 0, rg, compactable)
 
 	tb.Run()
 	tb.Pause()
@@ -232,12 +263,11 @@ func TestPeriodicPause(t *testing.T) {
 func TestPeriodicSkipRevNotChange(t *testing.T) {
 	retentionMinutes := 5
 	retentionDuration := time.Duration(retentionMinutes) * time.Minute
-	intervalDuration := time.Duration(0)
 
 	fc := clockwork.NewFakeClock()
 	rg := &fakeRevGetter{testutil.NewRecorderStreamWithWaitTimout(0), 0}
 	compactable := &fakeCompactable{testutil.NewRecorderStreamWithWaitTimout(20 * time.Millisecond)}
-	tb := newPeriodic(zaptest.NewLogger(t), fc, retentionDuration, intervalDuration, rg, compactable)
+	tb := newPeriodic(zaptest.NewLogger(t), fc, retentionDuration, 0, rg, compactable)
 
 	tb.Run()
 	defer tb.Stop()
