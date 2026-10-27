@@ -15,8 +15,10 @@
 package rafthttp
 
 import (
+	"errors"
 	"net/http"
 	"reflect"
+	"sync"
 	"testing"
 	"time"
 
@@ -204,5 +206,126 @@ func TestTransportErrorc(t *testing.T) {
 	case <-errorc:
 	case <-time.After(1 * time.Second):
 		t.Fatalf("cannot receive error from errorc")
+	}
+}
+
+// blockingWriteFlushCloser blocks every Write until released, like a
+// connection to a peer that died without closing its TCP connection.
+type blockingWriteFlushCloser struct {
+	writing  chan struct{}
+	released chan struct{}
+	once     sync.Once
+}
+
+func newBlockingWriteFlushCloser() *blockingWriteFlushCloser {
+	return &blockingWriteFlushCloser{writing: make(chan struct{}), released: make(chan struct{})}
+}
+
+func (w *blockingWriteFlushCloser) Write(p []byte) (int, error) {
+	w.once.Do(func() { close(w.writing) })
+	<-w.released
+	return 0, errors.New("connection released")
+}
+func (w *blockingWriteFlushCloser) Flush()       {}
+func (w *blockingWriteFlushCloser) Close() error { return nil }
+
+// TestTransportRemovePeerWithBlockedWriterDoesNotBlockSend ensures that
+// removing a peer whose stream writer is stuck on a half-open connection
+// neither blocks the caller nor messages sent to other peers.
+func TestTransportRemovePeerWithBlockedWriterDoesNotBlockSend(t *testing.T) {
+	peer2 := newFakePeer()
+	tr := &Transport{
+		Logger:         zaptest.NewLogger(t),
+		ID:             types.ID(100),
+		Raft:           &fakeRaft{},
+		ServerStats:    stats.NewServerStats("", ""),
+		LeaderStats:    stats.NewLeaderStats(zaptest.NewLogger(t), ""),
+		streamRt:       &roundTripperRecorder{},
+		pipelineRt:     &roundTripperRecorder{},
+		peers:          map[types.ID]Peer{types.ID(2): peer2},
+		pipelineProber: probing.NewProber(nil),
+		streamProber:   probing.NewProber(nil),
+	}
+	tr.AddPeer(types.ID(1), []string{"http://localhost:2380"})
+
+	w := newBlockingWriteFlushCloser()
+	defer func() {
+		close(w.released)
+		tr.Stop()
+	}()
+	tr.Get(types.ID(1)).attachOutgoingConn(&outgoingConn{
+		t: streamTypeMessage, Writer: w, Flusher: w, Closer: w,
+		localID: tr.ID, peerID: types.ID(1),
+	})
+	// The writer becomes working asynchronously; keep sending until it blocks.
+	testutil.WaitSchedule()
+	tr.Send([]*raftpb.Message{{Type: raftpb.MsgHeartbeat.Enum(), To: new(uint64(1))}})
+	select {
+	case <-w.writing:
+	case <-time.After(time.Second):
+		t.Fatal("stream writer did not start writing")
+	}
+
+	removed := make(chan struct{})
+	go func() {
+		tr.RemovePeer(types.ID(1))
+		close(removed)
+	}()
+	select {
+	case <-removed:
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("RemovePeer blocked on a peer with a stuck stream writer")
+	}
+
+	sent := make(chan struct{})
+	go func() {
+		tr.Send([]*raftpb.Message{{Type: raftpb.MsgHeartbeat.Enum(), To: new(uint64(2))}})
+		close(sent)
+	}()
+	select {
+	case <-sent:
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("Send to a healthy peer blocked while another peer was being removed")
+	}
+	if tr.Get(types.ID(1)) != nil {
+		t.Fatal("peer 1 still present after RemovePeer")
+	}
+}
+
+// TestTransportStopWaitsForConcurrentRemovePeer runs RemovePeer and Stop
+// concurrently: Stop must not return before every detached peer stopped, and
+// the WaitGroup must not be misused (run with -race).
+func TestTransportStopWaitsForConcurrentRemovePeer(t *testing.T) {
+	for i := 0; i < 200; i++ {
+		tr := &Transport{
+			Logger:         zaptest.NewLogger(t),
+			ID:             types.ID(100),
+			Raft:           &fakeRaft{},
+			ServerStats:    stats.NewServerStats("", ""),
+			LeaderStats:    stats.NewLeaderStats(zaptest.NewLogger(t), ""),
+			streamRt:       &roundTripperRecorder{},
+			pipelineRt:     &roundTripperRecorder{},
+			peers:          map[types.ID]Peer{},
+			pipelineProber: probing.NewProber(nil),
+			streamProber:   probing.NewProber(nil),
+		}
+		var fps []*fakePeer
+		for id := types.ID(1); id <= 3; id++ {
+			fp := newFakePeer()
+			fps = append(fps, fp)
+			tr.peers[id] = fp
+		}
+		var wg sync.WaitGroup
+		for id := types.ID(1); id <= 3; id++ {
+			wg.Add(1)
+			go func() { defer wg.Done(); tr.RemovePeer(id) }()
+		}
+		tr.Stop()
+		wg.Wait()
+		for j, fp := range fps {
+			if !fp.stopped.Load() {
+				t.Fatalf("iteration %d: peer %d not stopped after Stop and RemovePeer returned", i, j+1)
+			}
+		}
 	}
 }

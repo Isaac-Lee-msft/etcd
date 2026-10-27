@@ -127,6 +127,9 @@ type Transport struct {
 	remotes map[types.ID]*remote // remotes map that helps newly joined member to catch up
 	peers   map[types.ID]Peer    // peers map
 
+	// stoppingPeers tracks removed peers whose stop is still in flight.
+	stoppingPeers sync.WaitGroup
+
 	pipelineProber probing.Prober
 	streamProber   probing.Prober
 }
@@ -211,7 +214,6 @@ func (t *Transport) Send(msgs []*raftpb.Message) {
 
 func (t *Transport) Stop() {
 	t.mu.Lock()
-	defer t.mu.Unlock()
 	for _, r := range t.remotes {
 		r.stop()
 	}
@@ -228,6 +230,9 @@ func (t *Transport) Stop() {
 	}
 	t.peers = nil
 	t.remotes = nil
+	t.mu.Unlock()
+	// Wait for removed peers to finish stopping without holding t.mu.
+	t.stoppingPeers.Wait()
 }
 
 // CutPeer drops messages to the specified peer.
@@ -326,24 +331,46 @@ func (t *Transport) AddPeer(id types.ID, us []string) {
 
 func (t *Transport) RemovePeer(id types.ID) {
 	t.mu.Lock()
-	defer t.mu.Unlock()
-	t.removePeer(id)
+	p := t.detachPeer(id)
+	if p == nil {
+		t.mu.Unlock()
+		return
+	}
+	// Add under t.mu so Stop, which clears t.peers under t.mu before it
+	// waits, always sees this stop.
+	t.stoppingPeers.Add(1)
+	t.mu.Unlock()
+	// Stopping a peer can block until the stream write deadline expires when the
+	// remote is unreachable without having closed its connections (e.g. a crashed
+	// node). Stop it in the background so neither t.mu (and thus Send) nor the
+	// caller (the apply loop) is blocked.
+	go func() {
+		defer t.stoppingPeers.Done()
+		p.stop()
+	}()
 }
 
 func (t *Transport) RemoveAllPeers() {
 	t.mu.Lock()
-	defer t.mu.Unlock()
+	peers := make([]Peer, 0, len(t.peers))
 	for id := range t.peers {
-		t.removePeer(id)
+		peers = append(peers, t.detachPeer(id))
+	}
+	t.mu.Unlock()
+	// Stop synchronously so callers that re-add the same peers afterwards
+	// (e.g. applying a snapshot) never overlap with the old instances, but
+	// do it outside t.mu so Send is not blocked meanwhile.
+	for _, p := range peers {
+		p.stop()
 	}
 }
 
-// the caller of this function must have the peers mutex.
-func (t *Transport) removePeer(id types.ID) {
+// detachPeer removes the peer from the transport and returns it, or nil if
+// it is not found. The caller must hold t.mu and must stop the returned peer.
+func (t *Transport) detachPeer(id types.ID) Peer {
 	// etcd may remove a member again on startup due to WAL files replaying.
 	peer, ok := t.peers[id]
 	if ok {
-		peer.stop()
 		delete(t.peers, id)
 		delete(t.LeaderStats.Followers, id.String())
 		t.pipelineProber.Remove(id.String())
@@ -365,6 +392,10 @@ func (t *Transport) removePeer(id types.ID) {
 			)
 		}
 	}
+	if !ok {
+		return nil
+	}
+	return peer
 }
 
 func (t *Transport) UpdatePeer(id types.ID, us []string) {

@@ -23,6 +23,7 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -362,6 +363,7 @@ type fakePeer struct {
 	peerURLs types.URLs
 	connc    chan *outgoingConn
 	paused   bool
+	stopped  atomic.Bool
 }
 
 func newFakePeer() *fakePeer {
@@ -389,6 +391,6 @@ func (pr *fakePeer) sendSnap(m *snap.Message) {
 func (pr *fakePeer) update(urls types.URLs)                { pr.peerURLs = urls }
 func (pr *fakePeer) attachOutgoingConn(conn *outgoingConn) { pr.connc <- conn }
 func (pr *fakePeer) activeSince() time.Time                { return time.Time{} }
-func (pr *fakePeer) stop()                                 {}
+func (pr *fakePeer) stop()                                 { pr.stopped.Store(true) }
 func (pr *fakePeer) Pause()                                { pr.paused = true }
 func (pr *fakePeer) Resume()                               { pr.paused = false }
